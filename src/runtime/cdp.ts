@@ -110,6 +110,9 @@ export class CdpConnection {
   private readonly pending = new Map<number, PendingCall>()
   private readonly listeners = new Map<string, Set<CdpEventListener>>()
   private socket: WebSocketLike | null = null
+  private connecting: Promise<void> | null = null
+  private cancelConnect: ((error: Error) => void) | null = null
+  private detachSocket: (() => void) | null = null
 
   get connected() {
     return this.socket?.readyState === this.WebSocketImpl.OPEN
@@ -122,25 +125,79 @@ export class CdpConnection {
     this.timeoutMs = options.timeoutMs || DEFAULT_TIMEOUT_MS
   }
 
-  async connect() {
-    if (!this.WebSocketImpl) throw new Error("This Node.js runtime does not provide WebSocket.")
-    if (this.socket) return
-    const socket = new this.WebSocketImpl(this.url)
+  connect({ signal }: { signal?: AbortSignal } = {}): Promise<void> {
+    if (signal?.aborted) return Promise.reject(new Error("CDP connection cancelled."))
+    if (this.connected) return Promise.resolve()
+    if (this.connecting) return this.connecting
+    if (!this.WebSocketImpl)
+      return Promise.reject(new Error("This Node.js runtime does not provide WebSocket."))
+
+    let socket: WebSocketLike
+    try {
+      socket = new this.WebSocketImpl(this.url)
+    } catch (error) {
+      return Promise.reject(error)
+    }
     this.socket = socket
-    socket.addEventListener("message", (event) => this.handleMessage(event as MessageEvent))
-    socket.addEventListener("close", () => this.rejectPending(new Error("CDP connection closed.")))
-    await new Promise<void>((resolve, reject) => {
-      const onOpen = () => {
+    const onMessage = (event: Event) => this.handleMessage(event as MessageEvent)
+    const onSocketClose = () => {
+      if (this.socket !== socket) return
+      this.socket = null
+      this.rejectPending(new Error("CDP connection closed."))
+      this.detachSocket?.()
+      this.detachSocket = null
+    }
+    socket.addEventListener("message", onMessage)
+    socket.addEventListener("close", onSocketClose)
+    this.detachSocket = () => {
+      socket.removeEventListener("message", onMessage)
+      socket.removeEventListener("close", onSocketClose)
+    }
+    const handshake = new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timer)
+        socket.removeEventListener("open", onOpen)
         socket.removeEventListener("error", onError)
+        socket.removeEventListener("close", onClose)
+        signal?.removeEventListener("abort", onAbort)
+        this.cancelConnect = null
+      }
+      const fail = (error: Error) => {
+        cleanup()
+        if (this.socket === socket) {
+          this.detachSocket?.()
+          this.detachSocket = null
+          this.socket = null
+        }
+        try {
+          socket.close()
+        } catch {
+          /* Some transports reject close before open. */
+        }
+        reject(error)
+      }
+      const onOpen = () => {
+        cleanup()
         resolve()
       }
-      const onError = () => {
-        socket.removeEventListener("open", onOpen)
-        reject(new Error(`Unable to connect to CDP target: ${this.url}`))
-      }
+      const onError = () => fail(new Error(`Unable to connect to CDP target: ${this.url}`))
+      const onClose = () => fail(new Error("CDP connection closed before opening."))
+      const onAbort = () => fail(new Error("CDP connection cancelled."))
+      const timer = setTimeout(
+        () => fail(new Error("CDP connection handshake timed out.")),
+        this.timeoutMs,
+      )
+      this.cancelConnect = fail
       socket.addEventListener("open", onOpen, { once: true })
       socket.addEventListener("error", onError, { once: true })
+      socket.addEventListener("close", onClose, { once: true })
+      signal?.addEventListener("abort", onAbort, { once: true })
     })
+    const connecting = handshake.finally(() => {
+      if (this.connecting === connecting) this.connecting = null
+    })
+    this.connecting = connecting
+    return connecting
   }
 
   async call<Result = Record<string, unknown>>(
@@ -161,13 +218,29 @@ export class CdpConnection {
         reject,
         timer,
       })
-      this.socket?.send(JSON.stringify({ id, method, params }))
+      try {
+        this.socket?.send(JSON.stringify({ id, method, params }))
+      } catch (error) {
+        clearTimeout(timer)
+        this.pending.delete(id)
+        reject(error)
+      }
     })
   }
 
   close() {
-    this.socket?.close()
+    const socket = this.socket
+    this.cancelConnect?.(new Error("CDP connection cancelled."))
+    this.detachSocket?.()
+    this.detachSocket = null
     this.socket = null
+    this.rejectPending(new Error("CDP connection closed."))
+    this.listeners.clear()
+    try {
+      socket?.close()
+    } catch {
+      /* Already closed or never opened. */
+    }
   }
 
   on(method: string, listener: CdpEventListener) {
