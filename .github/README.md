@@ -1,5 +1,7 @@
 # Codex Skin: themes for the Codex desktop app
 
+> 本维护分支包含连接可靠性与运行状态重构。改动、验证与回滚方式见 [维护说明](../docs/runtime-reliability.zh-CN.md)。
+
 English | [简体中文](README.zh-CN.md)
 
 Codex Skin is an open-source macOS companion for giving the Codex desktop app a personal visual theme without modifying or re-signing `ChatGPT.app`. Its desktop client controls a global wallpaper, separate main-panel and sidebar scenes, transparency, positioning, soft edges, and an animated menu-bar icon.
