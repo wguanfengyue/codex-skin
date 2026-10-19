@@ -196,6 +196,16 @@ export function connectionDetails(
   if (!status) return { state: "ready", text: "正在连接本地服务" } as const
   if (!backgroundEnabled) return { state: "ready", text: "背景未启用" } as const
   if (!status.imageReadable) return { state: "error", text: "背景图片不可读取" } as const
+  if (status.runtime?.connection === "needs-restart")
+    return { state: "ready", text: "ChatGPT 需要重启后启用背景" } as const
+  if (status.runtime?.connection === "port-in-use")
+    return { state: "error", text: "背景连接端口被其他程序占用" } as const
+  if (status.runtime?.application === "failed")
+    return { state: "error", text: "背景应用失败，请重试" } as const
+  if (status.runtime?.application === "applied")
+    return { state: "connected", text: "背景已应用" } as const
+  if (status.runtime && status.cdpAvailable)
+    return { state: "ready", text: "等待 Codex 窗口应用背景" } as const
   if (status.cdpAvailable && status.daemonRunning) {
     return { state: "connected", text: "背景已连接" } as const
   }

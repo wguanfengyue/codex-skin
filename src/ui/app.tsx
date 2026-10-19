@@ -1,20 +1,21 @@
 import { useCallback, useEffect, useRef, useState } from "react"
-import type { ChangeEvent, DragEvent, FormEvent, PointerEvent as ReactPointerEvent } from "react"
+import type { ChangeEvent, DragEvent, FormEvent } from "react"
 
 import type { MenuBarIconId } from "../shared/menu-bar-icons.ts"
 import { ControlPanel } from "./components/control-panel.tsx"
 import { PreviewSection } from "./components/preview-section.tsx"
 import { SurfaceSettingsPanel } from "./components/surface-settings-panel.tsx"
 import { WallpaperSettingsPanel } from "./components/wallpaper-settings-panel.tsx"
+import { useIllustrationDrag } from "./hooks/use-illustration-drag.ts"
+import { useRuntimeStatus } from "./hooks/use-runtime-status.ts"
+import { useSettingsDraft } from "./hooks/use-settings-draft.ts"
 import { cn } from "./lib/cn.ts"
 import {
   acceptedImageTypes,
   api,
   apiErrorCode,
-  backgroundPositionFromDrag,
   backgroundSurfaces,
   connectionDetails,
-  defaultConfig,
   describeApplication,
   describeError,
   emptyBundledBackgroundCatalog,
@@ -22,31 +23,12 @@ import {
   setAllBackgroundsEnabled,
 } from "./model.ts"
 import type {
-  BackgroundConfig,
-  BackgroundStatus,
   BackgroundSettingsTab,
   BackgroundSurface,
   BusyAction,
   PreviewTheme,
   StatePayload,
-  SurfaceBackgroundConfig,
-  WallpaperConfig,
 } from "./types.ts"
-
-interface IllustrationDragState {
-  animationFrame?: number
-  illustrationHeight: number
-  illustrationWidth: number
-  initialX: number
-  initialY: number
-  pendingPosition?: { x: number; y: number }
-  pointerId: number
-  pointerX: number
-  pointerY: number
-  stageHeight: number
-  stageWidth: number
-  surface: BackgroundSurface
-}
 
 type ImageTargetValues<Value> = Record<BackgroundSettingsTab, Value>
 
@@ -67,10 +49,10 @@ const imageLabel = (image: string | null) =>
 
 /** Owns the settings page state and coordinates both independent Codex surfaces. */
 export function App() {
-  const [config, setConfig] = useState<BackgroundConfig>(defaultConfig)
-  const [status, setStatus] = useState<BackgroundStatus | null>(null)
+  const { config, setConfig, updateSurfaceConfig, updateWallpaperConfig, updatePosition } =
+    useSettingsDraft()
+  const { status, updateStatus, connectionFailed, setConnectionFailed } = useRuntimeStatus()
   const [bundledBackgrounds, setBundledBackgrounds] = useState(emptyBundledBackgroundCatalog)
-  const [connectionFailed, setConnectionFailed] = useState(false)
   const [activeTab, setActiveTab] = useState<BackgroundSettingsTab>("wallpaper")
   const [previewTheme, setPreviewTheme] = useState<PreviewTheme>("system")
   const [systemDark, setSystemDark] = useState(
@@ -82,16 +64,18 @@ export function App() {
   const [busyAction, setBusyAction] = useState<BusyAction>(null)
   const [toast, setToast] = useState<{ error: boolean; message: string }>()
   const [fileDragging, setFileDragging] = useState(false)
-  const [illustrationDragging, setIllustrationDragging] = useState<BackgroundSurface>()
   const imageInputRef = useRef<HTMLInputElement>(null)
   const imageInputTargetRef = useRef<BackgroundSettingsTab>("wallpaper")
-  const mainStageRef = useRef<HTMLDivElement>(null)
-  const sidebarStageRef = useRef<HTMLDivElement>(null)
   const toastTimerRef = useRef<number | undefined>(undefined)
   const dragDepthRef = useRef(0)
-  const illustrationDragRef = useRef<IllustrationDragState | undefined>(undefined)
 
-  const placementStageRefs = { main: mainStageRef, sidebar: sidebarStageRef }
+  const {
+    illustrationDragging,
+    placementStageRefs,
+    startIllustrationDrag,
+    moveIllustration,
+    finishIllustrationDrag,
+  } = useIllustrationDrag(config, setActiveTab, updatePosition)
 
   const notify = useCallback((message: string, error = false) => {
     window.clearTimeout(toastTimerRef.current)
@@ -99,29 +83,34 @@ export function App() {
     toastTimerRef.current = window.setTimeout(() => setToast(undefined), error ? 6500 : 3500)
   }, [])
 
-  const applyState = useCallback((payload: StatePayload) => {
-    const now = Date.now()
-    setConfig(payload.config)
-    setStatus(payload.status)
-    setBundledBackgrounds(payload.bundledBackgrounds)
-    setConnectionFailed(false)
-    setImageLabels({
-      wallpaper:
-        payload.bundledBackgrounds.wallpaper.selected || imageLabel(payload.config.wallpaper.image),
-      main:
-        payload.bundledBackgrounds.main.selected || imageLabel(payload.config.surfaces.main.image),
-      sidebar:
-        payload.bundledBackgrounds.sidebar.selected ||
-        imageLabel(payload.config.surfaces.sidebar.image),
-    })
-    setImageSources({
-      wallpaper: payload.config.wallpaper.image ? `/api/wallpaper/image?v=${now}` : undefined,
-      main: payload.config.surfaces.main.image ? `/api/surfaces/main/image?v=${now}` : undefined,
-      sidebar: payload.config.surfaces.sidebar.image
-        ? `/api/surfaces/sidebar/image?v=${now}`
-        : undefined,
-    })
-  }, [])
+  const applyState = useCallback(
+    (payload: StatePayload) => {
+      const now = Date.now()
+      setConfig(payload.config)
+      updateStatus(payload.status)
+      setBundledBackgrounds(payload.bundledBackgrounds)
+      setConnectionFailed(false)
+      setImageLabels({
+        wallpaper:
+          payload.bundledBackgrounds.wallpaper.selected ||
+          imageLabel(payload.config.wallpaper.image),
+        main:
+          payload.bundledBackgrounds.main.selected ||
+          imageLabel(payload.config.surfaces.main.image),
+        sidebar:
+          payload.bundledBackgrounds.sidebar.selected ||
+          imageLabel(payload.config.surfaces.sidebar.image),
+      })
+      setImageSources({
+        wallpaper: payload.config.wallpaper.image ? `/api/wallpaper/image?v=${now}` : undefined,
+        main: payload.config.surfaces.main.image ? `/api/surfaces/main/image?v=${now}` : undefined,
+        sidebar: payload.config.surfaces.sidebar.image
+          ? `/api/surfaces/sidebar/image?v=${now}`
+          : undefined,
+      })
+    },
+    [updateStatus],
+  )
 
   useEffect(() => {
     const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)")
@@ -148,126 +137,9 @@ export function App() {
   useEffect(
     () => () => {
       window.clearTimeout(toastTimerRef.current)
-      const animationFrame = illustrationDragRef.current?.animationFrame
-      if (animationFrame !== undefined) window.cancelAnimationFrame(animationFrame)
     },
     [],
   )
-
-  const updateSurfaceConfig = <Key extends keyof SurfaceBackgroundConfig>(
-    surface: BackgroundSurface,
-    key: Key,
-    value: SurfaceBackgroundConfig[Key],
-  ) => {
-    setConfig((current) => ({
-      ...current,
-      surfaces: {
-        ...current.surfaces,
-        [surface]: { ...current.surfaces[surface], [key]: value },
-      },
-    }))
-  }
-
-  const updateWallpaperConfig = <Key extends keyof WallpaperConfig>(
-    key: Key,
-    value: WallpaperConfig[Key],
-  ) => {
-    setConfig((current) => ({
-      ...current,
-      wallpaper: { ...current.wallpaper, [key]: value },
-    }))
-  }
-
-  const updatePosition = (
-    surface: BackgroundSurface,
-    illustrationX: number,
-    illustrationY: number,
-  ) => {
-    setConfig((current) => ({
-      ...current,
-      surfaces: {
-        ...current.surfaces,
-        [surface]: { ...current.surfaces[surface], illustrationX, illustrationY },
-      },
-    }))
-  }
-
-  const positionForPointer = (
-    drag: IllustrationDragState,
-    event: ReactPointerEvent<HTMLDivElement>,
-  ) => ({
-    x: backgroundPositionFromDrag({
-      illustrationLength: drag.illustrationWidth,
-      initialPosition: drag.initialX,
-      pointerDelta: event.clientX - drag.pointerX,
-      stageLength: drag.stageWidth,
-    }),
-    y: backgroundPositionFromDrag({
-      illustrationLength: drag.illustrationHeight,
-      initialPosition: drag.initialY,
-      pointerDelta: event.clientY - drag.pointerY,
-      stageLength: drag.stageHeight,
-    }),
-  })
-
-  const flushIllustrationPosition = () => {
-    const drag = illustrationDragRef.current
-    if (!drag) return
-    drag.animationFrame = undefined
-    const position = drag.pendingPosition
-    if (!position) return
-    drag.pendingPosition = undefined
-    updatePosition(drag.surface, position.x, position.y)
-  }
-
-  const startIllustrationDrag = (
-    surface: BackgroundSurface,
-    event: ReactPointerEvent<HTMLDivElement>,
-  ) => {
-    event.preventDefault()
-    const stageBounds = placementStageRefs[surface].current?.getBoundingClientRect()
-    if (!stageBounds) return
-    const illustrationBounds = event.currentTarget.getBoundingClientRect()
-    const surfaceConfig = config.surfaces[surface]
-    setActiveTab(surface)
-    illustrationDragRef.current = {
-      illustrationHeight: illustrationBounds.height,
-      illustrationWidth: illustrationBounds.width,
-      initialX: surfaceConfig.illustrationX,
-      initialY: surfaceConfig.illustrationY,
-      pointerId: event.pointerId,
-      pointerX: event.clientX,
-      pointerY: event.clientY,
-      stageHeight: stageBounds.height,
-      stageWidth: stageBounds.width,
-      surface,
-    }
-    setIllustrationDragging(surface)
-    event.currentTarget.setPointerCapture(event.pointerId)
-  }
-
-  const moveIllustration = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const drag = illustrationDragRef.current
-    if (!drag || drag.pointerId !== event.pointerId) return
-    drag.pendingPosition = positionForPointer(drag, event)
-    if (drag.animationFrame === undefined) {
-      drag.animationFrame = window.requestAnimationFrame(flushIllustrationPosition)
-    }
-  }
-
-  const finishIllustrationDrag = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const drag = illustrationDragRef.current
-    if (drag?.pointerId === event.pointerId) {
-      if (drag.animationFrame !== undefined) window.cancelAnimationFrame(drag.animationFrame)
-      const position = positionForPointer(drag, event)
-      updatePosition(drag.surface, position.x, position.y)
-      illustrationDragRef.current = undefined
-    }
-    setIllustrationDragging(undefined)
-    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-      event.currentTarget.releasePointerCapture(event.pointerId)
-    }
-  }
 
   const saveSettings = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault()

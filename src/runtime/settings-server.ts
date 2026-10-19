@@ -1,28 +1,15 @@
 import { spawn } from "node:child_process"
 import { randomBytes } from "node:crypto"
-import {
-  copyFile,
-  chmod,
-  mkdir,
-  readFile,
-  readdir,
-  rename,
-  rm,
-  stat,
-  unlink,
-  writeFile,
-} from "node:fs/promises"
+import { mkdir, readFile, rm, unlink, writeFile } from "node:fs/promises"
 import http from "node:http"
-import type { IncomingMessage, ServerResponse } from "node:http"
 import type { AddressInfo } from "node:net"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
 import { createCodexSkinCore } from "../core/index.ts"
 import type { CodexSkinCore } from "../core/index.ts"
-import { BackgroundStateError, startConfiguredBackground } from "./background-service.ts"
+import { startConfiguredBackground } from "./background-service.ts"
 import { readConfig, resolveDataDirectory, writeConfig } from "./config.ts"
-import { imageFileToDataUrl } from "./css.ts"
 import { readDaemonPid } from "./daemon.ts"
 import {
   codexSkinProcessCommandMatches,
@@ -33,6 +20,22 @@ import {
 } from "./process.ts"
 import type { ProcessIdentity, ProcessSummary } from "./process.ts"
 import { startBackgroundRestartWorker } from "./restart-worker.ts"
+import {
+  bundledBackgroundCatalog,
+  selectBundledBackground,
+  uploadImage,
+  IMAGE_EXTENSIONS,
+} from "./settings-assets.ts"
+import {
+  COOKIE_NAME,
+  readJsonBody,
+  securityHeaders,
+  sendJson,
+  requestIsAuthenticated,
+  serveStaticFile,
+  statusForError,
+} from "./settings-http.ts"
+import { mutateSettings } from "./settings-mutations.ts"
 import type {
   BackgroundConfig,
   BackgroundConfigInput,
@@ -45,11 +48,8 @@ import type {
 } from "./types.ts"
 import { BACKGROUND_SURFACES, errorCode, errorMessage } from "./types.ts"
 
-const MAX_JSON_BYTES = 64 * 1024
-const MAX_IMAGE_BYTES = 25 * 1024 * 1024
 const DEFAULT_IDLE_TIMEOUT_MS = 30 * 60 * 1000
 const defaultUiRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../dist/ui")
-const COOKIE_NAME = "codex_skin_settings"
 const EDITABLE_CONFIG_KEYS = new Set(["enabled", "menuBarIcon"])
 const EDITABLE_WALLPAPER_KEYS = new Set([
   "backgroundTransparency",
@@ -69,29 +69,6 @@ const EDITABLE_SURFACE_KEYS = new Set([
 const LEGACY_MAIN_SURFACE_KEYS = new Set(
   [...EDITABLE_SURFACE_KEYS].filter((key) => key !== "enabled"),
 )
-const IMAGE_EXTENSIONS = new Map([
-  ["image/avif", ".avif"],
-  ["image/gif", ".gif"],
-  ["image/jpeg", ".jpg"],
-  ["image/png", ".png"],
-  ["image/webp", ".webp"],
-])
-const CONTENT_TYPES = new Map([
-  [".avif", "image/avif"],
-  [".css", "text/css; charset=utf-8"],
-  [".gif", "image/gif"],
-  [".html", "text/html; charset=utf-8"],
-  [".jpeg", "image/jpeg"],
-  [".jpg", "image/jpeg"],
-  [".js", "text/javascript; charset=utf-8"],
-  [".map", "application/json; charset=utf-8"],
-  [".png", "image/png"],
-  [".svg", "image/svg+xml"],
-  [".webp", "image/webp"],
-])
-const BUNDLED_BACKGROUND_EXTENSIONS = new Set([".avif", ".gif", ".jpeg", ".jpg", ".png", ".webp"])
-const BACKGROUND_IMAGE_TARGETS = ["wallpaper", ...BACKGROUND_SURFACES] as const
-
 type KillProcess = (pid: number, signal: NodeJS.Signals | 0) => boolean
 
 interface SettingsProcessOptions extends DataDirectoryOptions {
@@ -116,12 +93,6 @@ export interface SettingsOptions extends SettingsProcessOptions {
   uiRoot?: string
 }
 
-interface BundledBackgroundOption {
-  file: string
-  label: string
-  url: string
-}
-
 function coreForSettings(options: SettingsOptions) {
   return (
     options.core ||
@@ -132,11 +103,6 @@ function coreForSettings(options: SettingsOptions) {
     })
   )
 }
-
-type BundledBackgroundCatalog = Record<
-  BackgroundImageTarget,
-  { items: BundledBackgroundOption[]; selected: string | null }
->
 
 interface SettingsServerState {
   pid: number
@@ -240,59 +206,6 @@ async function discoveredSettingsServerPids(options: SettingsProcessOptions) {
   return settingsServerPidsFromProcesses(await (options.listProcessesImpl || listProcesses)())
 }
 
-function securityHeaders(response: ServerResponse) {
-  response.setHeader("cache-control", "no-store")
-  response.setHeader(
-    "content-security-policy",
-    "default-src 'self'; img-src 'self' blob: data:; style-src 'self'; script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
-  )
-  response.setHeader("cross-origin-resource-policy", "same-origin")
-  response.setHeader("referrer-policy", "no-referrer")
-  response.setHeader("x-content-type-options", "nosniff")
-  response.setHeader("x-frame-options", "DENY")
-}
-
-function sendJson(response: ServerResponse, status: number, value: unknown) {
-  response.statusCode = status
-  response.setHeader("content-type", "application/json; charset=utf-8")
-  response.end(JSON.stringify(value))
-}
-
-function requestIsAuthenticated(request: IncomingMessage, token: string) {
-  const cookies = String(request.headers.cookie || "")
-    .split(";")
-    .map((value) => value.trim().split("="))
-  return cookies.some(([name, value]) => name === COOKIE_NAME && value === token)
-}
-
-async function readBody(request: IncomingMessage, maximumBytes: number) {
-  const chunks: Buffer[] = []
-  let bytes = 0
-  let tooLarge = false
-  for await (const chunk of request) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array)
-    bytes += buffer.length
-    if (bytes > maximumBytes) tooLarge = true
-    else chunks.push(buffer)
-  }
-  if (tooLarge) {
-    throw Object.assign(
-      new Error(`Request body exceeds ${Math.round(maximumBytes / 1024 / 1024)} MB.`),
-      { code: "BODY_TOO_LARGE" },
-    )
-  }
-  return Buffer.concat(chunks)
-}
-
-async function readJsonBody(request: IncomingMessage) {
-  const body = await readBody(request, MAX_JSON_BYTES)
-  try {
-    return JSON.parse(body.toString("utf8") || "{}") as unknown
-  } catch (cause) {
-    throw new Error("Invalid JSON request body.", { cause })
-  }
-}
-
 function editableConfig(input: unknown): BackgroundConfigInput {
   if (!input || typeof input !== "object" || Array.isArray(input)) {
     throw new Error("Configuration must be a JSON object.")
@@ -343,134 +256,6 @@ function editableConfig(input: unknown): BackgroundConfigInput {
   return result
 }
 
-function configuredImage(config: BackgroundConfig, target: BackgroundImageTarget) {
-  return target === "wallpaper" ? config.wallpaper.image : config.surfaces[target].image
-}
-
-function bundledBackgroundDestinationName(target: BackgroundImageTarget, file: string) {
-  return `builtin-${target}-${file}`
-}
-
-function bundledBackgroundLabel(file: string) {
-  return path.basename(file, path.extname(file)).replace(/[-_]+/g, " ").trim()
-}
-
-/** Reads supported image files directly from one bundled background directory. */
-async function bundledBackgroundItems(
-  target: BackgroundImageTarget,
-  options: SettingsOptions,
-): Promise<BundledBackgroundOption[]> {
-  const directory = path.join(options.backgroundsRoot || "", target)
-  try {
-    const entries = await readdir(directory, { withFileTypes: true })
-    return entries
-      .filter(
-        (entry) =>
-          entry.isFile() &&
-          BUNDLED_BACKGROUND_EXTENSIONS.has(path.extname(entry.name).toLowerCase()),
-      )
-      .map((entry) => ({
-        file: entry.name,
-        label: bundledBackgroundLabel(entry.name),
-        url: `/backgrounds/${target}/${encodeURIComponent(entry.name)}`,
-      }))
-      .sort((first, second) =>
-        first.label.localeCompare(second.label, "zh-CN", { numeric: true, sensitivity: "base" }),
-      )
-  } catch (error) {
-    if (errorCode(error) === "ENOENT") return []
-    throw error
-  }
-}
-
-/** Builds the current per-module selector options without requiring a separate manifest. */
-async function bundledBackgroundCatalog(
-  config: BackgroundConfig,
-  options: SettingsOptions,
-): Promise<BundledBackgroundCatalog> {
-  const groups = await Promise.all(
-    BACKGROUND_IMAGE_TARGETS.map(async (target) => {
-      const items = await bundledBackgroundItems(target, options)
-      const currentName = path.basename(configuredImage(config, target) || "")
-      const selected =
-        items.find((item) => bundledBackgroundDestinationName(target, item.file) === currentName)
-          ?.file || null
-      return [target, { items, selected }] as const
-    }),
-  )
-  return Object.fromEntries(groups) as BundledBackgroundCatalog
-}
-
-function imageIsStillReferenced(config: BackgroundConfig, image: string | null) {
-  return (
-    config.wallpaper.image === image ||
-    BACKGROUND_SURFACES.some((candidate) => config.surfaces[candidate].image === image)
-  )
-}
-
-async function removeUnusedManagedImage(
-  image: string | null,
-  replacement: string,
-  config: BackgroundConfig,
-  imageDirectory: string,
-) {
-  if (
-    image?.startsWith(`${imageDirectory}${path.sep}`) &&
-    image !== replacement &&
-    !imageIsStillReferenced(config, image)
-  ) {
-    await rm(image, { force: true })
-  }
-}
-
-async function selectBundledBackground(
-  input: unknown,
-  target: BackgroundImageTarget,
-  options: SettingsOptions,
-) {
-  const source = input && typeof input === "object" && !Array.isArray(input) ? input : {}
-  const requestedFile = "file" in source && typeof source.file === "string" ? source.file : ""
-  const item = (await bundledBackgroundItems(target, options)).find(
-    (candidate) => candidate.file === requestedFile,
-  )
-  if (!item) throw new Error("The selected bundled background does not exist.")
-
-  const sourcePath = path.join(options.backgroundsRoot || "", target, item.file)
-  await imageFileToDataUrl(sourcePath)
-  const imageDirectory = path.join(options.dataDirectory || resolveDataDirectory(), "images")
-  await mkdir(imageDirectory, { recursive: true, mode: 0o700 })
-  const destination = path.join(imageDirectory, bundledBackgroundDestinationName(target, item.file))
-  const extension = path.extname(item.file).toLowerCase()
-  const temporary = `${destination}.${process.pid}.${Date.now()}.tmp${extension}`
-  await copyFile(sourcePath, temporary)
-  try {
-    await chmod(temporary, 0o600)
-    await imageFileToDataUrl(temporary)
-    await rename(temporary, destination)
-  } catch (error) {
-    await rm(temporary, { force: true })
-    throw error
-  }
-
-  const previous = await readConfig({ dataDirectory: options.dataDirectory })
-  const previousImage = configuredImage(previous, target)
-  const config = await writeConfig(
-    target === "wallpaper"
-      ? { ...previous, wallpaper: { ...previous.wallpaper, enabled: true, image: destination } }
-      : {
-          ...previous,
-          surfaces: {
-            ...previous.surfaces,
-            [target]: { ...previous.surfaces[target], enabled: true, image: destination },
-          },
-        },
-    { dataDirectory: options.dataDirectory },
-  )
-  await removeUnusedManagedImage(previousImage, destination, config, imageDirectory)
-  const application = await coreForSettings(options).sync(config)
-  return { ...(await statePayload(config, options)), application }
-}
-
 async function statePayload(config: BackgroundConfig, options: SettingsOptions) {
   const core = coreForSettings(options)
   const [status, backgroundRunning] = await Promise.all([
@@ -478,7 +263,7 @@ async function statePayload(config: BackgroundConfig, options: SettingsOptions) 
     core.backgroundRunning(),
   ])
   return {
-    bundledBackgrounds: await bundledBackgroundCatalog(config, options),
+    bundledBackgrounds: await bundledBackgroundCatalog(config, { ...options, core }),
     config,
     status: {
       ...status,
@@ -511,57 +296,6 @@ async function saveAndSync(input: unknown, options: SettingsOptions) {
   return { ...(await statePayload(config, options)), application }
 }
 
-async function uploadImage(
-  request: IncomingMessage,
-  imageTarget: BackgroundImageTarget,
-  options: SettingsOptions,
-) {
-  const mediaType = String(request.headers["content-type"] || "")
-    .split(";", 1)[0]
-    ?.toLowerCase()
-  const extension = mediaType ? IMAGE_EXTENSIONS.get(mediaType) : undefined
-  if (!extension) throw new Error("Choose a PNG, JPEG, WebP, GIF, or AVIF image.")
-  const contents = await readBody(request, MAX_IMAGE_BYTES)
-  if (contents.length === 0) throw new Error("The selected image is empty.")
-
-  const imageDirectory = path.join(options.dataDirectory || resolveDataDirectory(), "images")
-  await mkdir(imageDirectory, { recursive: true, mode: 0o700 })
-  const now = Date.now()
-  const target = path.join(imageDirectory, `background-${imageTarget}-${now}${extension}`)
-  const temporary = `${target}.${process.pid}.tmp${extension}`
-  await writeFile(temporary, contents, { mode: 0o600 })
-  try {
-    await imageFileToDataUrl(temporary)
-    await rename(temporary, target)
-  } catch (error) {
-    await rm(temporary, { force: true })
-    throw error
-  }
-
-  const previous = await readConfig({ dataDirectory: options.dataDirectory })
-  const previousImage =
-    imageTarget === "wallpaper" ? previous.wallpaper.image : previous.surfaces[imageTarget].image
-  const config = await writeConfig(
-    imageTarget === "wallpaper"
-      ? { ...previous, wallpaper: { ...previous.wallpaper, enabled: true, image: target } }
-      : {
-          ...previous,
-          surfaces: {
-            ...previous.surfaces,
-            [imageTarget]: {
-              ...previous.surfaces[imageTarget],
-              enabled: true,
-              image: target,
-            },
-          },
-        },
-    { dataDirectory: options.dataDirectory },
-  )
-  await removeUnusedManagedImage(previousImage, target, config, imageDirectory)
-  const application = await coreForSettings(options).sync(config)
-  return { ...(await statePayload(config, options)), application }
-}
-
 function imageTarget(pathname: string): BackgroundImageTarget | undefined {
   if (pathname === "/api/image") return "main"
   if (pathname === "/api/wallpaper/image") return "wallpaper"
@@ -572,33 +306,6 @@ function imageTarget(pathname: string): BackgroundImageTarget | undefined {
 function bundledBackgroundTarget(pathname: string): BackgroundImageTarget | undefined {
   const match = pathname.match(/^\/api\/bundled-backgrounds\/(wallpaper|main|sidebar)$/)
   return match?.[1] as BackgroundImageTarget | undefined
-}
-
-function statusForError(error: unknown) {
-  if (errorCode(error) === "BODY_TOO_LARGE") return 413
-  if (error instanceof BackgroundStateError) return error.code === "RESTART_REQUIRED" ? 409 : 400
-  return 400
-}
-
-async function serveStaticFile(response: ServerResponse, pathname: string, uiRoot: string) {
-  const relativePath =
-    pathname === "/" ? "index.html" : decodeURIComponent(pathname).replace(/^\/+/, "")
-  const filePath = path.resolve(uiRoot, relativePath)
-  if (filePath !== uiRoot && !filePath.startsWith(`${uiRoot}${path.sep}`)) return false
-  try {
-    const metadata = await stat(filePath)
-    if (!metadata.isFile()) return false
-    response.statusCode = 200
-    response.setHeader(
-      "content-type",
-      CONTENT_TYPES.get(path.extname(filePath).toLowerCase()) || "application/octet-stream",
-    )
-    response.end(await readFile(filePath))
-    return true
-  } catch (error) {
-    if (errorCode(error) === "ENOENT") return false
-    throw error
-  }
 }
 
 export function createSettingsHttpServer(options: SettingsOptions) {
@@ -653,6 +360,14 @@ export function createSettingsHttpServer(options: SettingsOptions) {
         if (await serveStaticFile(response, url.pathname, uiRoot)) return
       }
 
+      if (request.method === "GET" && url.pathname === "/api/status") {
+        const config = await readConfig({ dataDirectory })
+        const running =
+          (await core.backgroundRunning()) ?? Boolean(await readDaemonPid({ dataDirectory }))
+        const status = await core.status(config, { preferRecordedState: running })
+        sendJson(response, 200, { status: { ...status, daemonRunning: running } })
+        return
+      }
       if (request.method === "GET" && url.pathname === "/api/state") {
         const config = await readConfig({ dataDirectory })
         sendJson(response, 200, await statePayload(config, runtimeOptions))
@@ -683,26 +398,35 @@ export function createSettingsHttpServer(options: SettingsOptions) {
       }
 
       if (request.method === "PUT" && url.pathname === "/api/config") {
-        sendJson(response, 200, await saveAndSync(await readJsonBody(request), runtimeOptions))
+        const input = await readJsonBody(request)
+        sendJson(
+          response,
+          200,
+          await mutateSettings(runtimeOptions, () => saveAndSync(input, runtimeOptions)),
+        )
         return
       }
 
       const selectedBundledBackground = bundledBackgroundTarget(url.pathname)
       if (request.method === "POST" && selectedBundledBackground) {
-        sendJson(
-          response,
-          200,
-          await selectBundledBackground(
-            await readJsonBody(request),
-            selectedBundledBackground,
-            runtimeOptions,
-          ),
+        const input = await readJsonBody(request)
+        const result = await mutateSettings(runtimeOptions, () =>
+          selectBundledBackground(input, selectedBundledBackground, runtimeOptions),
         )
+        sendJson(response, 200, {
+          ...(await statePayload(result.config, runtimeOptions)),
+          application: result.application,
+        })
         return
       }
-
       if (request.method === "POST" && requestedImageTarget) {
-        sendJson(response, 200, await uploadImage(request, requestedImageTarget, runtimeOptions))
+        const result = await mutateSettings(runtimeOptions, () =>
+          uploadImage(request, requestedImageTarget, runtimeOptions),
+        )
+        sendJson(response, 200, {
+          ...(await statePayload(result.config, runtimeOptions)),
+          application: result.application,
+        })
         return
       }
 

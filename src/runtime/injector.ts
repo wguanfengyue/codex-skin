@@ -106,10 +106,16 @@ export function buildInjectionExpression(css: string) {
     let installTimer;
     const scheduleInstall = () => {
       clearTimeout(installTimer);
-      installTimer = setTimeout(install, 120);
+      installTimer = setTimeout(() => {
+        install();
+        if (document.head) observer.observe(document.head, { childList: true });
+      }, 120);
     };
-    const observer = new MutationObserver(scheduleInstall);
-    observer.observe(document.documentElement, { childList: true, subtree: true });
+    const observer = new MutationObserver(() => {
+      if (!document.getElementById(styleId)) scheduleInstall();
+    });
+    observer.observe(document.documentElement, { childList: true });
+    if (document.head) observer.observe(document.head, { childList: true });
     window.__codexSkinCleanup = () => {
       observer.disconnect();
       clearTimeout(installTimer);
@@ -271,6 +277,7 @@ const buildTargetProbeExpression = () => `(() => {
 /** Maintains one CDP session per Codex window and reapplies CSS immediately after reloads. */
 export class TargetSessionManager {
   private readonly sessions = new Map<string, TargetSession>()
+  private readonly reloadTimers = new Set<ReturnType<typeof setTimeout>>()
   private css = ""
   private expression = ""
   private readonly options: TargetSessionManagerOptions
@@ -312,6 +319,8 @@ export class TargetSessionManager {
   }
 
   close() {
+    for (const timer of this.reloadTimers) clearTimeout(timer)
+    this.reloadTimers.clear()
     for (const { connection } of this.sessions.values()) connection.close()
     this.sessions.clear()
   }
@@ -339,11 +348,14 @@ export class TargetSessionManager {
         if (!accepted)
           throw new Error("Rejected a renderer that did not identify as a Codex window.")
         connection.on("Page.loadEventFired", () => {
-          setTimeout(() => {
+          const timer = setTimeout(() => {
+            this.reloadTimers.delete(timer)
+            if (this.sessions.get(key)?.connection !== connection || !connection.connected) return
             evaluateOnConnection(connection, this.expression).catch((error) => {
               this.options.onError?.(error instanceof Error ? error : new Error(String(error)))
             })
           }, 150)
+          this.reloadTimers.add(timer)
         })
         session = { connection, cssHash: "", target }
         this.sessions.set(key, session)

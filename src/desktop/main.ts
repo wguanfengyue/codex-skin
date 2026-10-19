@@ -5,13 +5,13 @@ import { app, BrowserWindow, dialog, Menu, nativeImage, net, shell, Tray } from 
 
 import { createCodexSkinCore } from "../core/index.ts"
 import type { CodexSkinCore } from "../core/index.ts"
-import { BackgroundStateError } from "../runtime/background-service.ts"
 import { readConfig, resolveDataDirectory } from "../runtime/config.ts"
 import { listenSettingsServer } from "../runtime/settings-server.ts"
 import { createDesktopBackgroundLifecycle } from "./background-lifecycle.ts"
 import { desktopDevelopmentSettings, desktopNavigationOrigins } from "./development.ts"
 import { createMenuBarIconController } from "./menu-bar-icon.ts"
 import type { MenuBarIconController } from "./menu-bar-icon.ts"
+import { startDesktopBackground } from "./startup.ts"
 import { createDesktopUpdateController, currentDesktopReleaseTag } from "./update.ts"
 import type { DesktopUpdateController } from "./update.ts"
 
@@ -178,18 +178,13 @@ async function createMainWindow(server: SettingsServer, rendererUrl?: string) {
 }
 
 async function startBackgroundOnLaunch(activeCore: CodexSkinCore) {
-  try {
-    await activeCore.start(await readConfig({ dataDirectory }))
-  } catch (error) {
-    if (error instanceof BackgroundStateError && error.code === "RESTART_REQUIRED") return
-    console.error("Unable to start Codex Skin:", error)
-    await dialog.showMessageBox({
-      buttons: ["好"],
-      detail: error instanceof Error ? error.message : String(error),
-      message: "Codex Skin 暂时无法启动背景服务",
-      type: "warning",
-    })
-  }
+  await startDesktopBackground(
+    activeCore,
+    await readConfig({ dataDirectory }),
+    async (message, detail) => {
+      await dialog.showMessageBox({ buttons: ["好"], message, detail, type: "info" })
+    },
+  )
 }
 
 async function closeSettingsServer(server: SettingsServer) {
@@ -270,7 +265,10 @@ if (!hasSingleInstanceLock) {
       })
       await createMainWindow(settingsServer, rendererUrl)
       updateController.startAutomaticChecks()
-      if (process.env.CODEX_SKIN_SKIP_AUTO_START !== "1") void startBackgroundOnLaunch(core)
+      if (process.env.CODEX_SKIN_SKIP_AUTO_START !== "1") {
+        await lifecycle.start()
+        void startBackgroundOnLaunch(core)
+      }
     })
     .catch((error) => {
       console.error("Unable to open Codex Skin:", error)
