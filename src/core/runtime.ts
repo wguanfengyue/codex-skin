@@ -9,7 +9,9 @@ import type { BackgroundServiceOptions } from "../runtime/background-service.ts"
 import { buildBackgroundCss } from "../runtime/css.ts"
 import { verifyAllTargets } from "../runtime/injector.ts"
 import type { TargetVerification } from "../runtime/injector.ts"
+import { configRevision } from "../runtime/runtime-state.ts"
 import type { BackgroundApplication, BackgroundConfig } from "../runtime/types.ts"
+import { createOperationQueue } from "./operation-queue.ts"
 
 /** Per-launch behavior that is intentionally separate from reusable runtime dependencies. */
 export interface CodexSkinCoreStartOptions {
@@ -25,7 +27,10 @@ export interface CodexSkinCore {
     config: BackgroundConfig,
     options?: CodexSkinCoreStartOptions,
   ): Promise<BackgroundApplication>
-  status(config: BackgroundConfig): ReturnType<typeof backgroundStatus>
+  status(
+    config: BackgroundConfig,
+    options?: { preferRecordedState?: boolean },
+  ): ReturnType<typeof backgroundStatus>
   sync(config: BackgroundConfig): Promise<BackgroundApplication>
   verify(config: BackgroundConfig, options?: { reload?: boolean }): Promise<TargetVerification[]>
 }
@@ -40,14 +45,29 @@ export type CodexSkinCoreOptions = Omit<BackgroundServiceOptions, "restartRunnin
  * detached daemon, while desktop clients can provide an in-process `backgroundLifecycle`.
  */
 export function createCodexSkinCore(options: CodexSkinCoreOptions = {}): CodexSkinCore {
+  const enqueue = createOperationQueue()
+  const starts = new Map<string, Promise<BackgroundApplication>>()
   return {
     backgroundRunning: async () => await options.backgroundLifecycle?.isRunning?.(),
     configuredCdpIsReady: async (config) => await configuredCdpIsReady(config, options),
-    inject: async (config) => await injectConfiguredBackground(config, options),
-    start: async (config, startOptions = {}) =>
-      await startConfiguredBackground(config, { ...options, ...startOptions }),
-    status: async (config) => await backgroundStatus(config, options),
-    sync: async (config) => await syncConfiguredBackground(config, options),
+    inject: async (config) => await enqueue(() => injectConfiguredBackground(config, options)),
+    start: (config, startOptions = {}) => {
+      const restart = startOptions.restartRunningCodex === true
+      const key = `${configRevision(config)}:${restart}`
+      const existing = starts.get(key)
+      if (existing) return existing
+      const task = enqueue(() => startConfiguredBackground(config, { ...options, ...startOptions }))
+      starts.set(key, task)
+      void task
+        .finally(() => {
+          if (starts.get(key) === task) starts.delete(key)
+        })
+        .catch(() => undefined)
+      return task
+    },
+    status: async (config, statusOptions = {}) =>
+      await backgroundStatus(config, { ...options, ...statusOptions }),
+    sync: async (config) => await enqueue(() => syncConfiguredBackground(config, options)),
     verify: async (config, verifyOptions = {}) =>
       await verifyAllTargets({
         css: await buildBackgroundCss(config),

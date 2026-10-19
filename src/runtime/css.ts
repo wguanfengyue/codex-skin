@@ -1,6 +1,3 @@
-import { readFile, stat } from "node:fs/promises"
-import path from "node:path"
-
 import { anchoredBackgroundPosition } from "../shared/background-position.ts"
 import {
   configuredBackgroundImages,
@@ -14,29 +11,8 @@ import type {
   WallpaperConfig,
 } from "./types.ts"
 
-const IMAGE_TYPES = new Map([
-  [".avif", "image/avif"],
-  [".gif", "image/gif"],
-  [".jpeg", "image/jpeg"],
-  [".jpg", "image/jpeg"],
-  [".png", "image/png"],
-  [".webp", "image/webp"],
-])
-const MAX_IMAGE_BYTES = 25 * 1024 * 1024
-
-/** Embeds a validated local image without changing its original bytes. */
-export async function imageFileToDataUrl(imagePath: string) {
-  const extension = path.extname(imagePath).toLowerCase()
-  const mediaType = IMAGE_TYPES.get(extension)
-  if (!mediaType) throw new Error(`Unsupported image type: ${extension || "no extension"}`)
-  const metadata = await stat(imagePath)
-  if (!metadata.isFile()) throw new Error(`Background image is not a file: ${imagePath}`)
-  if (metadata.size > MAX_IMAGE_BYTES) {
-    throw new Error(`Background image exceeds the 25 MB limit: ${imagePath}`)
-  }
-  const contents = await readFile(imagePath)
-  return `data:${mediaType};base64,${contents.toString("base64")}`
-}
+export { imageFileToDataUrl } from "./image-resource.ts"
+import { imageFileToDataUrl } from "./image-resource.ts"
 
 const SURFACE_SELECTORS = {
   main: [

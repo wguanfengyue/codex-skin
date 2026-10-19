@@ -1,5 +1,6 @@
 import { access } from "node:fs/promises"
 
+import type { BackgroundStatus } from "../shared/protocol.ts"
 import { isCdpAvailable } from "./cdp.ts"
 import {
   appExecutableExists,
@@ -14,6 +15,7 @@ import { configuredBackgroundImages, writeConfig } from "./config.ts"
 import { buildBackgroundCss, imageFileToDataUrl } from "./css.ts"
 import { ensureDaemon, stopDaemon } from "./daemon.ts"
 import { injectAllTargets, removeFromAllTargets } from "./injector.ts"
+import { configRevision, readRuntimeRecord, runtimeSnapshot } from "./runtime-state.ts"
 import {
   BACKGROUND_SURFACES,
   type BackgroundApplication,
@@ -53,6 +55,7 @@ export interface BackgroundServiceOptions {
   quitCodexImpl?: (appPath: string) => Promise<void>
   removeFromAllTargetsImpl?: (options: { port: number }) => Promise<number>
   restartRunningCodex?: boolean
+  preferRecordedState?: boolean
   startupPollIntervalMs?: number
   stopDaemonImpl?: () => Promise<number | null>
   timeoutMs?: number
@@ -277,8 +280,49 @@ export async function startConfiguredBackground(
 export async function backgroundStatus(
   config: BackgroundConfig,
   options: BackgroundServiceOptions = {},
-) {
-  const { httpReady, inspection } = await configuredCdpIsReady(config, options)
+): Promise<Omit<BackgroundStatus, "daemonRunning"> & { cdpPortState: CdpPortInspection["state"] }> {
+  const record = await readRuntimeRecord(options)
+  const recent =
+    options.preferRecordedState &&
+    record?.runtime &&
+    record.runtime.desiredRevision === configRevision(config) &&
+    Date.now() - Date.parse(record.runtime.observedAt) < 35000
+  const { httpReady, inspection } =
+    recent && record?.runtime
+      ? {
+          httpReady: record.runtime.connection === "connected",
+          inspection: {
+            codexPid: record.runtime.codexPid,
+            listenerPids: [],
+            state:
+              record.runtime.connection === "port-in-use"
+                ? ("occupied" as const)
+                : record.runtime.connection === "connected"
+                  ? ("codex" as const)
+                  : ("available" as const),
+          },
+        }
+      : await configuredCdpIsReady(config, options)
+  const codexPid = inspection.codexPid
+  const clientRunning = recent
+    ? Boolean(codexPid)
+    : httpReady ||
+      (options.isCodexRunningImpl
+        ? await options.isCodexRunningImpl(config.appPath)
+        : options.isCdpAvailableImpl
+          ? false
+          : await isCodexRunning(config.appPath))
+  const validRecord =
+    record?.codexPid === codexPid && record.runtime?.desiredRevision === configRevision(config)
+  const runtime = runtimeSnapshot(config, {
+    codexPid,
+    clientRunning,
+    cdpReady: httpReady,
+    occupied: inspection.state === "occupied",
+    targetCount: validRecord ? record?.runtime?.targetCount : 0,
+    appliedRevision: validRecord ? record?.runtime?.appliedRevision : undefined,
+    lastSuccessAt: record?.runtime?.lastSuccessAt,
+  })
   const surfaceEntries = await Promise.all(
     BACKGROUND_SURFACES.map(async (surface) => {
       const image = config.surfaces[surface].image
@@ -305,6 +349,7 @@ export async function backgroundStatus(
       (surface) => config.surfaces[surface].enabled && surfaces[surface].imageReadable,
     )
   return {
+    runtime,
     cdpAvailable: httpReady,
     cdpPortState: inspection.state,
     imageReadable,

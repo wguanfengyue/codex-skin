@@ -52,3 +52,28 @@ test("core synchronizes shutdown through the injected lifecycle", async () => {
   assert.deepEqual(events, ["stop-lifecycle"])
   assert.deepEqual(result, { applied: true, mode: "removed", pid: 42, targets: 0 })
 })
+
+test("duplicate core starts share one in-flight operation", async () => {
+  let release!: () => void
+  let starts = 0
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const core = createCodexSkinCore({
+    appExecutableExistsImpl: async () => {
+      starts++
+      await gate
+      return true
+    },
+    isCdpAvailableImpl: async () => true,
+    isCodexRunningImpl: async () => true,
+    backgroundLifecycle: { start: async () => ({ pid: 42 }), stop: async () => null },
+  })
+  const config = normalizeConfig({ enabled: false })
+  const first = core.start(config),
+    second = core.start(config)
+  assert.equal(first, second)
+  release()
+  await Promise.all([first, second])
+  assert.equal(starts, 1)
+})

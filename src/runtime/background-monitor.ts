@@ -1,28 +1,27 @@
-import { appendFile, mkdir, rm, writeFile } from "node:fs/promises"
+import { appendFile, mkdir } from "node:fs/promises"
 import path from "node:path"
 
+import type { RuntimeSnapshot } from "../shared/protocol.ts"
 import { isCdpAvailable } from "./cdp.ts"
 import { findCodexProcessId, inspectCdpPort } from "./client.ts"
 import { configuredBackgroundImages, readConfig, resolveDataDirectory } from "./config.ts"
 import { buildBackgroundCss } from "./css.ts"
+import { imageRevision } from "./image-resource.ts"
 import { removeFromAllTargets, TargetSessionManager } from "./injector.ts"
-import type { DataDirectoryOptions } from "./types.ts"
+import { configRevision, runtimeSnapshot, writeRuntimeRecord } from "./runtime-state.ts"
+import type { BackgroundConfig, DataDirectoryOptions } from "./types.ts"
 import { errorMessage } from "./types.ts"
 
 export interface BackgroundMonitorOptions extends DataDirectoryOptions {
-  /** Stops a detached CLI monitor after Codex closes. Client-owned monitors stay resident. */
   exitWhenCodexCloses?: boolean
-  /** Allows the owning process to stop the monitor without process-level signals. */
   signal?: AbortSignal
-}
-
-function monitorPaths(options: DataDirectoryOptions) {
-  const dataDirectory = options.dataDirectory || resolveDataDirectory(options.env)
-  return {
-    dataDirectory,
-    log: path.join(dataDirectory, "daemon.log"),
-    state: path.join(dataDirectory, "daemon-state.json"),
-  }
+  readConfigImpl?: typeof readConfig
+  observeClientImpl?: (
+    config: BackgroundConfig,
+  ) => Promise<{ pid: number | null; ready: boolean; occupied: boolean }>
+  createSessionsImpl?: (port: number) => Pick<TargetSessionManager, "synchronize" | "close">
+  writeStateImpl?: (state: RuntimeSnapshot) => Promise<void>
+  removeImpl?: typeof removeFromAllTargets
 }
 
 function waitForNextPoll(delayMs: number, signal?: AbortSignal) {
@@ -38,89 +37,135 @@ function waitForNextPoll(delayMs: number, signal?: AbortSignal) {
   })
 }
 
-/**
- * Keeps new Codex renderer targets synchronized without owning the host process lifecycle.
- *
- * Detached CLI daemons and in-process desktop clients supply different stop behavior while
- * sharing this same renderer synchronization loop.
- */
+/** Observe every state transition; retain historical success without reporting it as current. */
 export async function runBackgroundMonitor(options: BackgroundMonitorOptions = {}) {
-  const paths = monitorPaths(options)
-  await mkdir(paths.dataDirectory, { recursive: true, mode: 0o700 })
+  const directory = options.dataDirectory || resolveDataDirectory(options.env)
+  await mkdir(directory, { recursive: true, mode: 0o700 })
+  const log = (error: unknown) =>
+    appendFile(
+      path.join(directory, "daemon.log"),
+      `${new Date().toISOString()} ${errorMessage(error)}\n`,
+      { mode: 0o600 },
+    )
+  const publish = options.writeStateImpl || ((state) => writeRuntimeRecord(state, options))
   let observedCodex = false
-  let cachedConfig = ""
-  let cachedCss = ""
-  let targetSessions: TargetSessionManager | undefined
+  let cachedSignature = "",
+    cachedCss = ""
+  let sessions: Pick<TargetSessionManager, "synchronize" | "close"> | undefined
   let sessionPort: number | undefined
-
+  let lastSuccessAt: string | undefined
+  let lastSnapshot: RuntimeSnapshot | undefined
+  let previousState = ""
+  let lastWrite = 0
   try {
     while (!options.signal?.aborted) {
       let pollIntervalMs = 3000
+      let config: BackgroundConfig | undefined
+      let pid: number | null = null
       try {
-        const config = await readConfig(options)
+        config = await (options.readConfigImpl || readConfig)(options)
         pollIntervalMs = config.pollIntervalMs
-        const codexPid = await findCodexProcessId(config.appPath)
-        if (codexPid) observedCodex = true
-        else if (options.exitWhenCodexCloses && codexLifecycleEnded(observedCodex, codexPid)) {
-          break
-        }
-
-        const cdpPort = await inspectCdpPort(config.appPath, config.port)
-        const cdpReady = cdpPort.state === "codex" && (await isCdpAvailable({ port: config.port }))
-        const hasConfiguredBackground = configuredBackgroundImages(config).length > 0
-        if (config.enabled && hasConfiguredBackground && cdpReady) {
-          const signature = JSON.stringify(config)
-          if (signature !== cachedConfig) {
+        const observation = options.observeClientImpl
+          ? await options.observeClientImpl(config)
+          : await observeClient(config)
+        pid = observation.pid
+        if (pid) observedCodex = true
+        const revision = configRevision(config)
+        let targetCount = 0
+        let appliedRevision: string | undefined
+        const hasImages = configuredBackgroundImages(config).length > 0
+        if (config.enabled && hasImages && observation.ready && !options.signal?.aborted) {
+          const signature = revision + (await imageRevision(configuredBackgroundImages(config)))
+          if (signature !== cachedSignature) {
             cachedCss = await buildBackgroundCss(config)
-            cachedConfig = signature
+            cachedSignature = signature
           }
-          if (!targetSessions || sessionPort !== config.port) {
-            targetSessions?.close()
+          if (!sessions || sessionPort !== config.port) {
+            sessions?.close()
             sessionPort = config.port
-            targetSessions = new TargetSessionManager({
-              port: config.port,
-              onError: (error) => {
-                appendFile(paths.log, `${new Date().toISOString()} ${error.message}\n`, {
-                  mode: 0o600,
-                }).catch(() => undefined)
-              },
-            })
+            sessions =
+              options.createSessionsImpl?.(config.port) ||
+              new TargetSessionManager({
+                port: config.port,
+                onError: (error) => {
+                  void log(error).catch(() => undefined)
+                },
+              })
           }
-          const results = await targetSessions.synchronize(cachedCss)
-          await writeFile(
-            paths.state,
-            `${JSON.stringify(
-              {
-                pid: process.pid,
-                codexPid,
-                updatedAt: new Date().toISOString(),
-                injectedTargets: results.filter((result) => result.ok).length,
-                failedTargets: results.filter((result) => !result.ok).length,
-              },
-              null,
-              2,
-            )}\n`,
-            { mode: 0o600 },
-          )
-        } else if (targetSessions) {
-          const removalPort = sessionPort || config.port
-          targetSessions.close()
-          targetSessions = undefined
+          // Do not inject a configuration superseded while preparing image data.
+          const latest = await (options.readConfigImpl || readConfig)(options)
+          if (configRevision(latest) === revision && !options.signal?.aborted) {
+            const results = await sessions.synchronize(cachedCss)
+            targetCount = results.filter((result) => result.ok).length
+            if (targetCount > 0) {
+              appliedRevision = revision
+              lastSuccessAt = new Date().toISOString()
+            }
+          }
+        } else if (sessions) {
+          const port = sessionPort || config.port
+          sessions.close()
+          sessions = undefined
           sessionPort = undefined
-          cachedConfig = ""
-          cachedCss = ""
-          await removeFromAllTargets({ port: removalPort }).catch(() => undefined)
+          cachedSignature = ""
+          if (observation.ready && !options.signal?.aborted)
+            await (options.removeImpl || removeFromAllTargets)({ port })
         }
-      } catch (error) {
-        await appendFile(paths.log, `${new Date().toISOString()} ${errorMessage(error)}\n`, {
-          mode: 0o600,
+        const state = runtimeSnapshot(config, {
+          codexPid: pid,
+          cdpReady: observation.ready,
+          occupied: observation.occupied,
+          targetCount,
+          appliedRevision,
+          lastSuccessAt,
         })
+        lastSnapshot = state
+        const signature = JSON.stringify({
+          ...state,
+          observedAt: undefined,
+          lastSuccessAt: undefined,
+        })
+        if (signature !== previousState || Date.now() - lastWrite >= 30000) {
+          await publish(state)
+          previousState = signature
+          lastWrite = Date.now()
+        }
+        if (options.exitWhenCodexCloses && codexLifecycleEnded(observedCodex, pid)) break
+      } catch (error) {
+        if (config)
+          await publish(
+            runtimeSnapshot(config, {
+              codexPid: pid,
+              cdpReady: false,
+              lastSuccessAt,
+              error: errorMessage(error),
+            }),
+          )
+        await log(error)
       }
       await waitForNextPoll(pollIntervalMs, options.signal)
     }
   } finally {
-    targetSessions?.close()
-    await rm(paths.state, { force: true })
+    sessions?.close()
+    if (lastSnapshot)
+      await publish({
+        ...lastSnapshot,
+        observedAt: new Date().toISOString(),
+        application: lastSnapshot.application === "disabled" ? "disabled" : "pending",
+        targetCount: 0,
+        appliedRevision: undefined,
+        reason: "monitor-stopped",
+      })
+  }
+}
+
+async function observeClient(config: BackgroundConfig) {
+  const inspection = await inspectCdpPort(config.appPath, config.port)
+  const pid = inspection.codexPid ?? (await findCodexProcessId(config.appPath))
+  return {
+    pid,
+    occupied: inspection.state === "occupied",
+    ready: inspection.state === "codex" && (await isCdpAvailable({ port: config.port })),
   }
 }
 

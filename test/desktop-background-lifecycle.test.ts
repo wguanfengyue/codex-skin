@@ -40,3 +40,35 @@ test("desktop lifecycle reuses one monitor and stops it through AbortSignal", as
   assert.equal(await lifecycle.isRunning?.(), false)
   assert.equal(stopDaemonCalls, 2)
 })
+
+test("concurrent desktop starts establish only one monitor before stop drains it", async () => {
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  let starts = 0,
+    stops = 0
+  const lifecycle = createDesktopBackgroundLifecycle({
+    dataDirectory: "/tmp/codex-skin-concurrent",
+    stopDaemonImpl: async () => {
+      stops++
+      if (stops === 1) await gate
+      return null
+    },
+    runMonitorImpl: async ({ signal }) => {
+      starts++
+      await new Promise<void>((resolve) =>
+        signal!.addEventListener("abort", () => resolve(), { once: true }),
+      )
+    },
+  })
+  const first = lifecycle.start(),
+    second = lifecycle.start(),
+    stop = lifecycle.stop()
+  release()
+  assert.equal((await first).started, true)
+  assert.equal((await second).started, false)
+  await stop
+  assert.equal(starts, 1)
+  assert.equal(await lifecycle.isRunning?.(), false)
+})

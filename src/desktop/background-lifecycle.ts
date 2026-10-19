@@ -1,4 +1,5 @@
 import type { BackgroundLifecycleAdapter } from "../core/index.ts"
+import { createOperationQueue } from "../core/operation-queue.ts"
 import { runBackgroundMonitor } from "../runtime/background-monitor.ts"
 import type { BackgroundMonitorOptions } from "../runtime/background-monitor.ts"
 import { stopDaemon } from "../runtime/daemon.ts"
@@ -14,44 +15,47 @@ interface DesktopBackgroundLifecycleOptions {
 export function createDesktopBackgroundLifecycle(
   options: DesktopBackgroundLifecycleOptions,
 ): BackgroundLifecycleAdapter {
+  const enqueue = createOperationQueue()
   let controller: AbortController | undefined
   let monitorTask: Promise<void> | undefined
 
   return {
     isRunning: async () => monitorTask !== undefined,
-    start: async () => {
-      if (monitorTask) return { owner: "desktop", pid: process.pid, started: false }
+    start: () =>
+      enqueue(async () => {
+        if (monitorTask) return { owner: "desktop", pid: process.pid, started: false }
 
-      await (options.stopDaemonImpl || stopDaemon)({ dataDirectory: options.dataDirectory })
-      controller = new AbortController()
-      const activeController = controller
-      const runMonitor = options.runMonitorImpl || runBackgroundMonitor
-      const task = runMonitor({
-        dataDirectory: options.dataDirectory,
-        exitWhenCodexCloses: false,
-        signal: activeController.signal,
-      })
-        .catch((error) => {
-          options.onError?.(error)
+        await (options.stopDaemonImpl || stopDaemon)({ dataDirectory: options.dataDirectory })
+        controller = new AbortController()
+        const activeController = controller
+        const runMonitor = options.runMonitorImpl || runBackgroundMonitor
+        const task = runMonitor({
+          dataDirectory: options.dataDirectory,
+          exitWhenCodexCloses: false,
+          signal: activeController.signal,
         })
-        .finally(() => {
-          if (monitorTask === task) {
-            controller = undefined
-            monitorTask = undefined
-          }
-        })
-      monitorTask = task
-      return { owner: "desktop", pid: process.pid, started: true }
-    },
-    stop: async () => {
-      const activeTask = monitorTask
-      const wasRunning = Boolean(activeTask)
-      controller?.abort()
-      const [daemonPid] = await Promise.all([
-        (options.stopDaemonImpl || stopDaemon)({ dataDirectory: options.dataDirectory }),
-        activeTask,
-      ])
-      return wasRunning ? process.pid : daemonPid
-    },
+          .catch((error) => {
+            options.onError?.(error)
+          })
+          .finally(() => {
+            if (monitorTask === task) {
+              controller = undefined
+              monitorTask = undefined
+            }
+          })
+        monitorTask = task
+        return { owner: "desktop", pid: process.pid, started: true }
+      }),
+    stop: () =>
+      enqueue(async () => {
+        const activeTask = monitorTask
+        const wasRunning = Boolean(activeTask)
+        controller?.abort()
+        const [daemonPid] = await Promise.all([
+          (options.stopDaemonImpl || stopDaemon)({ dataDirectory: options.dataDirectory }),
+          activeTask,
+        ])
+        return wasRunning ? process.pid : daemonPid
+      }),
   }
 }

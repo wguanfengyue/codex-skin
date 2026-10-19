@@ -7,24 +7,8 @@ export const BACKGROUND_SURFACES = ["main", "sidebar"] as const
 export type BackgroundSurface = (typeof BACKGROUND_SURFACES)[number]
 export type BackgroundImageTarget = BackgroundSurface | "wallpaper"
 
-export interface SurfaceBackgroundConfig {
-  enabled: boolean
-  image: string | null
-  illustrationSize: number
-  illustrationX: number
-  illustrationY: number
-  illustrationBlur: number
-  illustrationOpacity: number
-}
-
-export interface WallpaperConfig {
-  backgroundTransparency: number
-  enabled: boolean
-  image: string | null
-  fit: "contain" | "cover"
-  positionX: number
-  positionY: number
-}
+export type { SurfaceBackgroundConfig, WallpaperConfig } from "../shared/protocol.ts"
+import type { SurfaceBackgroundConfig, WallpaperConfig } from "../shared/protocol.ts"
 
 export interface BackgroundConfig {
   version: 7
